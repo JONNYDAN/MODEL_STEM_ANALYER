@@ -41,12 +41,33 @@ TRANSLATION_DICT = {
     
     # Vòng đời động vật
     'trứng': 'egg',
+    'trung': 'egg',
+    'trửng': 'egg',
     'nòng nọc': 'tadpole',
+    'nong noc': 'tadpole',
+    'nòng noc': 'tadpole',
+    'nông nọc': 'tadpole',
     'ếch con': 'froglet',
+    'ech con': 'froglet',
+    'ếch': 'frog',
+    'ech': 'frog',
     'ếch trưởng thành': 'adult frog',
+    'ech truong thanh': 'adult frog',
+    'trưởng thành': 'adult',
+    'truong thanh': 'adult',
+    'thanh': 'adult',
     'sâu bướm': 'caterpillar',
+    'sau buom': 'caterpillar',
+    'sâu': 'caterpillar',
+    'sau': 'caterpillar',
     'nhộng': 'pupa',
+    'nhong': 'pupa',
     'bướm': 'butterfly',
+    'buom': 'butterfly',
+    'có chân': 'with legs',
+    'co chan': 'with legs',
+    'tương': 'similar',
+    'tuong': 'similar',
     
     # Thực vật
     'hạt': 'seed',
@@ -80,25 +101,61 @@ def normalize_text(text):
     text = re.sub(r'^[^\w\s]+|[^\w\s]+$', '', text)
     return text
 
+def remove_vietnamese_accents(text):
+    """Loại bỏ dấu tiếng Việt để matching tốt hơn"""
+    # Bảng chuyển đổi ký tự có dấu sang không dấu
+    accents = {
+        'á': 'a', 'à': 'a', 'ả': 'a', 'ã': 'a', 'ạ': 'a',
+        'ă': 'a', 'ắ': 'a', 'ằ': 'a', 'ẳ': 'a', 'ẵ': 'a', 'ặ': 'a',
+        'â': 'a', 'ấ': 'a', 'ầ': 'a', 'ẩ': 'a', 'ẫ': 'a', 'ậ': 'a',
+        'é': 'e', 'è': 'e', 'ẻ': 'e', 'ẽ': 'e', 'ẹ': 'e',
+        'ê': 'e', 'ế': 'e', 'ề': 'e', 'ể': 'e', 'ễ': 'e', 'ệ': 'e',
+        'í': 'i', 'ì': 'i', 'ỉ': 'i', 'ĩ': 'i', 'ị': 'i',
+        'ó': 'o', 'ò': 'o', 'ỏ': 'o', 'õ': 'o', 'ọ': 'o',
+        'ô': 'o', 'ố': 'o', 'ồ': 'o', 'ổ': 'o', 'ỗ': 'o', 'ộ': 'o',
+        'ơ': 'o', 'ớ': 'o', 'ờ': 'o', 'ở': 'o', 'ỡ': 'o', 'ợ': 'o',
+        'ú': 'u', 'ù': 'u', 'ủ': 'u', 'ũ': 'u', 'ụ': 'u',
+        'ư': 'u', 'ứ': 'u', 'ừ': 'u', 'ử': 'u', 'ữ': 'u', 'ự': 'u',
+        'ý': 'y', 'ỳ': 'y', 'ỷ': 'y', 'ỹ': 'y', 'ỵ': 'y',
+        'đ': 'd',
+    }
+    for accent, no_accent in accents.items():
+        text = text.replace(accent, no_accent)
+    return text
+
 def translate_to_english(text):
     """Dịch text sang tiếng Anh"""
     normalized = normalize_text(text)
     
     # Kiểm tra xem đã là tiếng Anh chưa
     if re.match(r'^[a-zA-Z\s]+$', normalized):
+        # Kiểm tra trong dictionary trước khi return
+        if normalized in TRANSLATION_DICT:
+            return TRANSLATION_DICT[normalized]
         return normalized
     
-    # Tìm trong dictionary
+    # Tìm trong dictionary với text gốc (có dấu)
     if normalized in TRANSLATION_DICT:
         return TRANSLATION_DICT[normalized]
     
-    # Tìm partial match
+    # Thử loại bỏ dấu và tìm lại
+    normalized_no_accent = remove_vietnamese_accents(normalized)
+    if normalized_no_accent in TRANSLATION_DICT:
+        return TRANSLATION_DICT[normalized_no_accent]
+    
+    # Tìm partial match với text gốc
     for viet_term, eng_term in TRANSLATION_DICT.items():
         if viet_term in normalized or normalized in viet_term:
             return eng_term
     
-    # Không tìm thấy, trả về original
-    return normalized
+    # Tìm partial match với text không dấu
+    for viet_term, eng_term in TRANSLATION_DICT.items():
+        viet_no_accent = remove_vietnamese_accents(viet_term)
+        if viet_no_accent in normalized_no_accent or normalized_no_accent in viet_no_accent:
+            return eng_term
+    
+    # Không tìm thấy, trả về bản không dấu
+    return normalized_no_accent
 
 def detect_objects_with_ocr(image_np):
     """Phát hiện và nhận diện đối tượng STEM bằng OCR"""
