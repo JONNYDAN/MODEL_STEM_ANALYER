@@ -11,8 +11,10 @@ import os
 import re
 import requests as req
 import unicodedata
+import threading
 from datetime import datetime, timedelta
 from PIL import Image
+from typing import Any, Dict, List, Optional
 
 try:
     import psycopg2
@@ -67,6 +69,27 @@ VI_EN_PHRASE_MAP = {
     "lady bug": "ladybug",
     "laydybug": "ladybug",
     "bo rua": "ladybug",
+    "vong tuan hoan nuoc": "water cycle",
+    "chu trinh nuoc": "water cycle",
+    "he mat troi": "solar system",
+    "nhat thuc": "solar eclipse",
+    "nguyet thuc": "lunar eclipse",
+    "cau truc nui lua": "volcano structure",
+    "nui lua": "volcano",
+    "dung nham": "lava",
+    "cac phan cua hoa": "parts of a flower",
+    "mach dien": "electric circuit",
+    "ve mach dien": "draw electric circuit",
+    "qua trinh quang hop": "photosynthesis process",
+    "quang hop": "photosynthesis",
+    "con ga": "chicken",
+    "con vit": "duck",
+    "chan cua ga": "chicken leg",
+    "chan cua vit": "duck leg",
+    "con tho": "rabbit",
+    "con cao": "fox",
+    "co": "grass",
+    "khong an": "not eat",
 }
 
 TRANSLATION_DICT = {
@@ -115,13 +138,39 @@ TRANSLATION_DICT = {
     'bo rua': 'ladybug',
     'lady bug': 'ladybug',
     'laydybug': 'ladybug',
+    'vòng tuần hoàn nước': 'water cycle',
+    'chu trình nước': 'water cycle',
+    'hệ mặt trời': 'solar system',
+    'nhật thực': 'solar eclipse',
+    'nguyệt thực': 'lunar eclipse',
+    'cấu trúc núi lửa': 'volcano structure',
+    'núi lửa': 'volcano',
+    'dung nham': 'lava',
+    'các phần của hoa': 'parts of a flower',
+    'cánh hoa': 'petal',
+    'nhị hoa': 'stamen',
+    'nhụy hoa': 'pistil',
+    'đài hoa': 'sepal',
+    'mạch điện': 'electric circuit',
+    'dòng điện': 'electric current',
+    'điện trở': 'resistor',
+    'quá trình quang hợp': 'photosynthesis process',
+    'quang hợp': 'photosynthesis',
+    'chân gà': 'chicken leg',
+    'chân vịt': 'duck leg',
+    'gà': 'chicken',
+    'vịt': 'duck',
+    'thỏ': 'rabbit',
+    'cáo': 'fox',
+    'cỏ': 'grass',
+    'ăn': 'eat',
 }
 
 _taxonomy_cache = {"data": None, "expires_at": datetime.min}
 
 VI_FILLER_TOKENS = {
     "cua", "la", "nhung", "cac", "cho", "toi", "hay", "xin", "vui", "long", "ve", "duoc",
-    "khong", "o", "dau", "mot", "va", "hoac", "the", "nao", "gi", "co", "trong",
+    "o", "dau", "mot", "va", "hoac", "the", "nao", "gi", "co", "trong", "sao", "ma", "lai",
     "con", "nhu",
 }
 
@@ -132,6 +181,240 @@ GENERIC_SUBJECT_TOKENS = {
 GENERIC_CATEGORY_TOKENS = {
     "life", "cycle", "cycles", "diagram", "process", "system", "stage", "stages",
 }
+
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in (os.getenv("GEMINI_FALLBACK_MODELS", "gemini-1.5-flash,gemini-1.5-pro") or "").split(",")
+    if model.strip()
+]
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
+GEMINI_ONLY_MODE = os.getenv("GEMINI_ONLY_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+_gemini_rotation_lock = threading.Lock()
+_gemini_rotation_index = 0
+
+
+def _get_gemini_api_keys() -> List[str]:
+    keys: List[str] = []
+
+    single_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if single_key:
+        keys.append(single_key)
+
+    keys_csv = (os.getenv("GEMINI_API_KEYS") or "").strip()
+    if keys_csv:
+        keys.extend([key.strip() for key in keys_csv.split(",") if key.strip()])
+
+    for idx in range(1, 31):
+        value = (os.getenv(f"GEMINI_API_KEY_{idx}") or "").strip()
+        if value:
+            keys.append(value)
+
+    return list(dict.fromkeys(keys))
+
+
+def _rotate_keys(keys: List[str]) -> List[str]:
+    if not keys:
+        return []
+
+    global _gemini_rotation_index
+    with _gemini_rotation_lock:
+        start = _gemini_rotation_index % len(keys)
+        _gemini_rotation_index += 1
+
+    return keys[start:] + keys[:start]
+
+
+def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+
+    content = text.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?", "", content).strip()
+        content = re.sub(r"```$", "", content).strip()
+
+    try:
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _call_gemini_json(
+    prompt: str,
+    image_np: Optional[np.ndarray] = None,
+    model_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    api_keys = _get_gemini_api_keys()
+    if not api_keys:
+        return None
+
+    primary_model = (model_name or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    model_candidates = [primary_model] + [m for m in GEMINI_FALLBACK_MODELS if m != primary_model]
+
+    parts: List[Dict[str, Any]] = [{"text": prompt}]
+    if image_np is not None:
+        try:
+            encoded_ok, buffer = cv2.imencode('.png', cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+            if encoded_ok:
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(buffer).decode("utf-8"),
+                        }
+                    }
+                )
+        except Exception:
+            pass
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "response_mime_type": "application/json",
+        },
+    }
+
+    for model in model_candidates:
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for key in _rotate_keys(api_keys):
+            try:
+                response = req.post(
+                    f"{api_url}?key={key}",
+                    json=payload,
+                    timeout=GEMINI_TIMEOUT_SECONDS,
+                )
+                if response.status_code >= 400:
+                    continue
+
+                body = response.json()
+                candidates = body.get("candidates") or []
+                if not candidates:
+                    continue
+
+                content = (candidates[0].get("content") or {})
+                response_parts = content.get("parts") or []
+                if not response_parts:
+                    continue
+
+                text = response_parts[0].get("text")
+                if not text:
+                    continue
+
+                parsed = _extract_json_payload(text)
+                if parsed:
+                    return parsed
+            except Exception:
+                continue
+
+    return None
+
+
+def _gemini_semantic_enrichment(
+    original_query: str,
+    normalized_query_en: str,
+    corrected_query_en: str,
+    detected_labels: List[str],
+    taxonomy: Dict[str, Any],
+    image_np: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    category_options = [
+        item.get("category_name")
+        for item in taxonomy.get("categories", [])[:80]
+        if item.get("category_name")
+    ]
+    subject_options = [
+        item.get("subject_name")
+        for item in taxonomy.get("subjects", [])[:150]
+        if item.get("subject_name")
+    ]
+
+    prompt = (
+        "You are a STEM multimodal analyzer. Return valid JSON only with this schema: "
+        "{\"normalized_query_en\": string, \"corrected_query_en\": string, "
+        "\"detected_subject_terms\": string[], \"detected_category_terms\": string[], "
+        "\"sro_candidates\": [{\"subject\": string, \"relationship\": string, \"object\": string}], "
+        "\"analysis_case\": \"case_1_category_keyword\"|\"case_2_subject_or_sro\"|\"case_3_pending_learning\", "
+        "\"description\": string, \"youtube_queries\": string[], "
+        "\"scientific_analysis\": {"
+        "\"summary\": string, "
+        "\"key_points\": string[], "
+        "\"reasoning_steps\": string[], "
+        "\"applications\": string[], "
+        "\"glossary\": [{\"term\": string, \"definition\": string}], "
+        "\"recommended_queries\": string[]"
+        "} }. "
+        "Rules: normalize to English, fix spelling, infer entities from text/image labels, "
+        "prioritize provided taxonomy options when possible, relationship must use snake_case. "
+        "Use concise factual educational language.\n\n"
+        f"Original user text: {original_query or ''}\n"
+        f"Normalized text EN (rule-based): {normalized_query_en or ''}\n"
+        f"Corrected text EN (rule-based): {corrected_query_en or ''}\n"
+        f"OCR labels EN: {detected_labels or []}\n"
+        f"Available category options: {category_options}\n"
+        f"Available subject options: {subject_options}\n"
+    )
+
+    response_json = _call_gemini_json(prompt=prompt, image_np=image_np)
+    if not response_json:
+        return {}
+
+    if not isinstance(response_json.get("detected_subject_terms"), list):
+        response_json["detected_subject_terms"] = []
+    if not isinstance(response_json.get("detected_category_terms"), list):
+        response_json["detected_category_terms"] = []
+    if not isinstance(response_json.get("sro_candidates"), list):
+        response_json["sro_candidates"] = []
+    if not isinstance(response_json.get("youtube_queries"), list):
+        response_json["youtube_queries"] = []
+
+    scientific_analysis = response_json.get("scientific_analysis")
+    if not isinstance(scientific_analysis, dict):
+        response_json["scientific_analysis"] = {
+            "summary": "",
+            "key_points": [],
+            "reasoning_steps": [],
+            "applications": [],
+            "glossary": [],
+            "recommended_queries": [],
+        }
+    else:
+        for list_key in ["key_points", "reasoning_steps", "applications", "glossary", "recommended_queries"]:
+            if not isinstance(scientific_analysis.get(list_key), list):
+                scientific_analysis[list_key] = []
+        if not isinstance(scientific_analysis.get("summary"), str):
+            scientific_analysis["summary"] = ""
+
+    return response_json
+
+
+def _dedupe_triples(triples: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    cleaned: List[Dict[str, str]] = []
+    for triple in triples:
+        subject = _clean_text(str(triple.get("subject", "")))
+        relationship = _clean_text(str(triple.get("relationship", ""))).replace(" ", "_")
+        object_value = _clean_text(str(triple.get("object", "")))
+        if subject and relationship and object_value:
+            cleaned.append(
+                {
+                    "subject": subject,
+                    "relationship": relationship,
+                    "object": object_value,
+                }
+            )
+    return [dict(item) for item in {tuple(row.items()) for row in cleaned}]
 
 
 def _normalize_ascii(text: str) -> str:
@@ -440,12 +723,41 @@ def _parse_text_triple(text_en: str) -> list:
     if not text_en:
         return []
 
+    eat_verbs = {"eat", "eats", "consume", "consumes"}
+    token_triples = []
+    words = [tok for tok in _clean_text(text_en).split() if tok]
+
+    for idx, token in enumerate(words):
+        if token not in eat_verbs:
+            continue
+
+        is_negative = idx > 0 and words[idx - 1] == "not"
+        subject_index = idx - 2 if is_negative else idx - 1
+        object_index = idx + 1
+
+        if subject_index < 0 or object_index >= len(words):
+            continue
+
+        subject = words[subject_index]
+        object_value = words[object_index]
+        if not subject or not object_value:
+            continue
+
+        token_triples.append(
+            {
+                "subject": subject,
+                "relationship": "not_eat" if is_negative else "eat",
+                "object": object_value,
+            }
+        )
+
     patterns = [
-        r"([a-z0-9 ]{2,})\s+(left of|right of|above|below|around|inside|contains|part of|related to)\s+([a-z0-9 ]{2,})",
-        r"([a-z0-9 ]{2,})\s*->\s*([a-z0-9_ ]{2,})\s*->\s*([a-z0-9 ]{2,})",
+        r"([a-z0-9]+(?:\s+[a-z0-9]+){0,3})\s+(left of|right of|above|below|around|inside|contains|part of|related to)\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,3})",
+        r"([a-z0-9]+(?:\s+[a-z0-9]+){0,3})\s*->\s*([a-z0-9_ ]{2,})\s*->\s*([a-z0-9]+(?:\s+[a-z0-9]+){0,3})",
+        r"([a-z0-9]+(?:\s+[a-z0-9]+){0,3})\s+(is part of|belongs to|depends on|interacts with)\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,3})",
     ]
 
-    triples = []
+    triples = list(token_triples)
     for pattern in patterns:
         found = re.findall(pattern, text_en)
         for item in found:
@@ -549,19 +861,81 @@ def _analyze_intent(query_text: str = "", image_np: np.ndarray = None, source_na
     for label in detected_labels:
         all_terms.update(_extract_tokens(label))
 
+    gemini_enrichment = _gemini_semantic_enrichment(
+        original_query=query_text or "",
+        normalized_query_en=text_en,
+        corrected_query_en=corrected_text_en,
+        detected_labels=detected_labels,
+        taxonomy=taxonomy,
+        image_np=image_np,
+    )
+
+    if GEMINI_ONLY_MODE and not gemini_enrichment:
+        raise RuntimeError("Gemini-only mode is enabled but Gemini analysis failed or returned empty output")
+
+    gemini_normalized_text = _clean_text(str(gemini_enrichment.get("normalized_query_en", "")))
+    gemini_corrected_text = _clean_text(str(gemini_enrichment.get("corrected_query_en", "")))
+    if gemini_normalized_text:
+        text_en = gemini_normalized_text
+    if gemini_corrected_text:
+        corrected_text_en = gemini_corrected_text
+
+    gemini_subject_terms = [
+        _clean_text(str(item))
+        for item in gemini_enrichment.get("detected_subject_terms", [])
+        if _clean_text(str(item))
+    ]
+    gemini_category_terms = [
+        _clean_text(str(item))
+        for item in gemini_enrichment.get("detected_category_terms", [])
+        if _clean_text(str(item))
+    ]
+
+    for term in gemini_subject_terms + gemini_category_terms:
+        all_terms.update(_extract_tokens(term))
+
     category_candidates = _match_categories(all_terms, taxonomy)
     subject_candidates = _match_subjects(all_terms, taxonomy)
 
     sro_candidates = []
     sro_candidates.extend(_parse_text_triple(corrected_text_en))
     sro_candidates.extend(_extract_spatial_relationships(objects))
-    sro_candidates = [dict(t) for t in {tuple(item.items()) for item in sro_candidates}]
+    sro_candidates.extend(gemini_enrichment.get("sro_candidates", []))
+    sro_candidates = _dedupe_triples(sro_candidates)
+
+    if not category_candidates and gemini_category_terms:
+        category_candidates = _match_categories(set(_extract_tokens(" ".join(gemini_category_terms))), taxonomy)
+
+    if not subject_candidates and gemini_subject_terms:
+        subject_candidates = _match_subjects(set(_extract_tokens(" ".join(gemini_subject_terms))), taxonomy)
+
+    if GEMINI_ONLY_MODE:
+        gemini_query_terms = set(_extract_tokens(gemini_corrected_text or gemini_normalized_text or ""))
+        for term in gemini_subject_terms + gemini_category_terms + detected_labels:
+            gemini_query_terms.update(_extract_tokens(term))
+
+        category_candidates = _match_categories(gemini_query_terms, taxonomy)
+        subject_candidates = _match_subjects(gemini_query_terms, taxonomy)
+        sro_candidates = _dedupe_triples(gemini_enrichment.get("sro_candidates", []))
 
     phase = "text"
     if image_np is not None and query_text:
         phase = "multimodal"
     elif image_np is not None:
         phase = "image"
+
+    analysis_case = "case_3_pending_learning"
+    if category_candidates:
+        analysis_case = "case_1_category_keyword"
+    elif subject_candidates or sro_candidates:
+        analysis_case = "case_2_subject_or_sro"
+
+    if gemini_enrichment.get("analysis_case") in {
+        "case_1_category_keyword",
+        "case_2_subject_or_sro",
+        "case_3_pending_learning",
+    }:
+        analysis_case = gemini_enrichment.get("analysis_case")
 
     image_size = None
     annotated_image = None
@@ -590,6 +964,13 @@ def _analyze_intent(query_text: str = "", image_np: np.ndarray = None, source_na
         "category_candidates": category_candidates,
         "subject_candidates": subject_candidates,
         "sro_candidates": sro_candidates,
+        "analysis_case": analysis_case,
+        "creative_recommendation": {
+            "description": gemini_enrichment.get("description"),
+            "youtube_queries": gemini_enrichment.get("youtube_queries", []),
+            "scientific_analysis": gemini_enrichment.get("scientific_analysis", {}),
+        },
+        "gemini_enrichment": gemini_enrichment,
         "annotated_image": annotated_image,
     }
 

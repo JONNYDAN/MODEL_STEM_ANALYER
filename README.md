@@ -7,6 +7,9 @@ API nhận diện đối tượng trong ảnh STEM sử dụng OCR (Optical Char
 - ✅ Nhận diện văn bản trong ảnh STEM bằng EasyOCR
 - ✅ Hỗ trợ tiếng Việt và tiếng Anh
 - ✅ Tự động dịch thuật sang tiếng Anh
+- ✅ Chuẩn hóa tiếng Anh + sửa lỗi chính tả theo taxonomy từ PostgreSQL
+- ✅ Phân tích ngữ nghĩa đa phương thức bằng Gemini (text/image)
+- ✅ Hỗ trợ key rotation cho Gemini (`GEMINI_API_KEY_1..n`)
 - ✅ Trả về confidence score cho mỗi detection
 - ✅ Vẽ bounding box và label lên ảnh
 - ✅ Hỗ trợ cả file upload và URL
@@ -26,6 +29,36 @@ python app.py
 ```
 
 Server sẽ chạy tại `http://localhost:5000`
+
+### 3. Cấu hình Gemini (khuyến nghị)
+
+Thiết lập biến môi trường trước khi chạy API:
+
+```bash
+# Một key
+set GEMINI_API_KEY=your_key
+
+# Hoặc nhiều key để rotation
+set GEMINI_API_KEY_1=your_key_1
+set GEMINI_API_KEY_2=your_key_2
+set GEMINI_API_KEY_3=your_key_3
+
+# Tùy chọn
+set GEMINI_MODEL=gemini-2.5-flash
+set GEMINI_TIMEOUT_SECONDS=30
+set GEMINI_ONLY_MODE=true
+```
+
+API sẽ tự động thử lần lượt key theo thứ tự khi gọi Gemini.
+Để luân phiên key theo mỗi request, có thể khai báo nhiều key:
+
+```bash
+set GEMINI_API_KEY_1=your_key_1
+set GEMINI_API_KEY_2=your_key_2
+set GEMINI_API_KEY_3=your_key_3
+set GEMINI_API_KEY_4=your_key_4
+set GEMINI_API_KEY_5=your_key_5
+```
 
 ## API Endpoints
 
@@ -122,6 +155,18 @@ Phân tích ảnh từ URL.
 ```
 
 **Response:** Giống như `/api/analyze`
+
+### 4. Analyze Intent (Text / Image / Multimodal)
+
+**POST** `/api/analyze_intent`
+
+Endpoint dùng cho API tích hợp (pha 1/2/3), nhận `query_text`, `image` hoặc cả hai.
+
+Các trường chính trong response:
+- `phase`: `text` | `image` | `multimodal`
+- `analysis_case`: `case_1_category_keyword` | `case_2_subject_or_sro` | `case_3_pending_learning`
+- `category_candidates`, `subject_candidates`, `sro_candidates`
+- `creative_recommendation.description`, `creative_recommendation.youtube_queries`
 
 ## Sử dụng với Python Client
 
